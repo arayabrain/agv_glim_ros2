@@ -56,6 +56,7 @@ private:
   bool dump_on_unload;
 
   std::string intensity_field, ring_field;
+  double last_points_stamp_ros_ = -1.0;
 
   // Extension modulles
   std::vector<std::shared_ptr<ExtensionModule>> extension_modules;

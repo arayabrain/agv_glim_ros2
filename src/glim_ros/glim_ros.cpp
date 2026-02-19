@@ -279,6 +279,14 @@ void GlimROS::image_callback(const sensor_msgs::msg::Image::ConstSharedPtr msg) 
 #endif
 
 size_t GlimROS::points_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+  const double msg_stamp = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9;
+  if (last_points_stamp_ros_ > 0.0 && msg_stamp < last_points_stamp_ros_ - 1.0) {
+    spdlog::warn("time jump detected (current={:.3f} last={:.3f}). shutting down for restart.", msg_stamp, last_points_stamp_ros_);
+    rclcpp::shutdown();
+    return 0;
+  }
+  last_points_stamp_ros_ = msg_stamp;
+
   spdlog::trace("points: {}.{}", msg->header.stamp.sec, msg->header.stamp.nanosec);
   if (!GlobalConfig::instance()->has_param("meta", "lidar_frame_id")) {
     spdlog::debug("auto-detecting LiDAR frame ID: {}", msg->header.frame_id);
