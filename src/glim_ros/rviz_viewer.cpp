@@ -29,6 +29,7 @@ RvizViewer::RvizViewer() : logger(create_module_logger("rviz")) {
   map_frame_id = config.param<std::string>("glim_ros", "map_frame_id", "map");
   publish_imu2lidar = config.param<bool>("glim_ros", "publish_imu2lidar", true);
   tf_time_offset = config.param<double>("glim_ros", "tf_time_offset", 1e-6);
+  nearby_map_radius = config.param<double>("glim_ros", "nearby_map_radius", 50.0);
 
   last_globalmap_pub_time = rclcpp::Clock(rcl_clock_type_t::RCL_ROS_TIME).now();
   trajectory.reset(new TrajectoryManager);
@@ -53,6 +54,9 @@ RvizViewer::RvizViewer() : logger(create_module_logger("rviz")) {
 RvizViewer::~RvizViewer() {
   kill_switch = true;
   thread.join();
+  if (globalmap_thread.joinable()) {
+    globalmap_thread.join();
+  }
 }
 
 std::vector<GenericTopicSubscription::Ptr> RvizViewer::create_subscriptions(rclcpp::Node& node) {
@@ -79,6 +83,7 @@ std::vector<GenericTopicSubscription::Ptr> RvizViewer::create_subscriptions(rclc
   rclcpp::QoS map_qos(rclcpp::QoSInitialization(map_qos_profile.history, map_qos_profile.depth), map_qos_profile);
   map_pub = node.create_publisher<sensor_msgs::msg::PointCloud2>("~/map", map_qos);
   submap_pub = node.create_publisher<sensor_msgs::msg::PointCloud2>("~/submap", 10);
+  nearby_map_pub = node.create_publisher<sensor_msgs::msg::PointCloud2>("~/nearby_map", 10);
   odom_pub = node.create_publisher<nav_msgs::msg::Odometry>("~/odom", 10);
   pose_pub = node.create_publisher<geometry_msgs::msg::PoseStamped>("~/pose", 10);
   odom_scanend_pub = node.create_publisher<nav_msgs::msg::Odometry>("~/odom_scanend", 10);
@@ -166,6 +171,13 @@ void RvizViewer::odometry_new_frame(const EstimationFrame::ConstPtr& new_frame, 
 
     T_world_imu = trajectory->odom2world(T_odom_imu);
     quat_world_imu = Eigen::Quaterniond(T_world_imu.linear());
+  }
+
+  // Update current position for nearby map
+  {
+    std::lock_guard<std::mutex> lock(current_pose_mutex);
+    current_position = T_world_imu.translation();
+    has_current_position = true;
   }
 
   // Publish transforms
@@ -384,6 +396,74 @@ void RvizViewer::odometry_new_frame(const EstimationFrame::ConstPtr& new_frame, 
 
     logger->debug("published aligned_points (stamp={} num_points={})", new_frame->stamp, frame.size());
   }
+
+  // Publish nearby map on each odometry frame (non-corrected only to avoid double publish)
+  if (!corrected) {
+    publish_nearby_map();
+  }
+}
+
+void RvizViewer::publish_nearby_map() {
+  if (!nearby_map_pub->get_subscription_count()) {
+    return;
+  }
+
+  Eigen::Vector3d pos;
+  {
+    std::lock_guard<std::mutex> lock(current_pose_mutex);
+    if (!has_current_position) return;
+    pos = current_position;
+  }
+
+  std::vector<SubmapEntry> entries_snapshot;
+  {
+    std::lock_guard<std::mutex> lock(submap_mutex);
+    entries_snapshot = submap_entries;
+  }
+
+  if (entries_snapshot.empty()) return;
+
+  const double radius_sq = nearby_map_radius * nearby_map_radius;
+
+  // Collect nearby submaps
+  int total_num_points = 0;
+  std::vector<int> nearby_indices;
+  for (int i = 0; i < entries_snapshot.size(); i++) {
+    const double dist_sq = (entries_snapshot[i].T_world_origin.translation() - pos).squaredNorm();
+    if (dist_sq <= radius_sq) {
+      nearby_indices.push_back(i);
+      total_num_points += entries_snapshot[i].frame->size();
+    }
+  }
+
+  if (nearby_indices.empty()) return;
+
+  // Merge nearby submaps
+  gtsam_points::PointCloudCPU::Ptr merged(new gtsam_points::PointCloudCPU);
+  merged->num_points = total_num_points;
+  merged->points_storage.resize(total_num_points);
+  merged->points = merged->points_storage.data();
+  merged->intensities_storage.resize(total_num_points);
+  merged->intensities = merged->intensities_storage.data();
+
+  int begin = 0;
+  for (int idx : nearby_indices) {
+    const auto& entry = entries_snapshot[idx];
+    const auto& submap = entry.frame;
+    std::transform(submap->points, submap->points + submap->size(), merged->points + begin, [&](const Eigen::Vector4d& p) { return entry.T_world_origin * p; });
+    if (submap->intensities) {
+      std::copy(submap->intensities, submap->intensities + submap->size(), merged->intensities + begin);
+    } else {
+      std::fill(merged->intensities + begin, merged->intensities + begin + submap->size(), 0.0);
+    }
+    begin += submap->size();
+  }
+
+  const rclcpp::Time now = rclcpp::Clock(rcl_clock_type_t::RCL_ROS_TIME).now();
+  auto points_msg = frame_to_pointcloud2(map_frame_id, now.seconds(), *merged);
+  nearby_map_pub->publish(*points_msg);
+
+  logger->debug("published nearby_map (num_submaps={} num_points={})", nearby_indices.size(), total_num_points);
 }
 
 void RvizViewer::globalmap_on_update_submaps(const std::vector<SubMap::Ptr>& submaps) {
@@ -396,15 +476,18 @@ void RvizViewer::globalmap_on_update_submaps(const std::vector<SubMap::Ptr>& sub
     trajectory->update_anchor(stamp_endpoint_R, T_world_endpoint_R);
   }
 
-  std::vector<Eigen::Isometry3d, Eigen::aligned_allocator<Eigen::Isometry3d>> submap_poses(submaps.size());
-  for (int i = 0; i < submaps.size(); i++) {
-    submap_poses[i] = submaps[i]->T_world_origin;
+  // Update submap entries with latest poses from global mapping
+  {
+    std::lock_guard<std::mutex> lock(submap_mutex);
+    submap_entries.resize(submaps.size());
+    for (int i = 0; i < submaps.size(); i++) {
+      submap_entries[i].T_world_origin = submaps[i]->T_world_origin;
+      submap_entries[i].frame = submaps[i]->frame;
+    }
   }
 
   // Publish the latest submap immediately
-  invoke([this, latest_submap, submap_poses] {
-    this->submaps.push_back(latest_submap->frame);
-
+  invoke([this, latest_submap] {
     if (submap_pub->get_subscription_count()) {
       const auto& submap_frame = latest_submap->frame;
       const auto& T_world_origin = latest_submap->T_world_origin;
@@ -430,42 +513,62 @@ void RvizViewer::globalmap_on_update_submaps(const std::vector<SubMap::Ptr>& sub
       return;
     }
 
-    // Publish global map every 10 seconds
+    // Publish global map every 10 seconds in a separate thread
     const rclcpp::Time now = rclcpp::Clock(rcl_clock_type_t::RCL_ROS_TIME).now();
     if (now - last_globalmap_pub_time < std::chrono::seconds(10)) {
       return;
     }
+    if (globalmap_request.load()) {
+      return;  // Previous global map publish is still in progress
+    }
     last_globalmap_pub_time = now;
+    globalmap_request.store(true);
 
-    logger->warn("Publishing global map is computationally demanding and not recommended");
-
-    int total_num_points = 0;
-    for (const auto& submap : this->submaps) {
-      total_num_points += submap->size();
+    // Join previous thread if any
+    if (globalmap_thread.joinable()) {
+      globalmap_thread.join();
     }
 
-    // Concatenate all the submap points and intensities
-    gtsam_points::PointCloudCPU::Ptr merged(new gtsam_points::PointCloudCPU);
-    merged->num_points = total_num_points;
-    merged->points_storage.resize(total_num_points);
-    merged->points = merged->points_storage.data();
-    merged->intensities_storage.resize(total_num_points);
-    merged->intensities = merged->intensities_storage.data();
+    globalmap_thread = std::thread([this] {
+      logger->info("Building global map in background thread...");
 
-    int begin = 0;
-    for (int i = 0; i < this->submaps.size(); i++) {
-      const auto& submap = this->submaps[i];
-      std::transform(submap->points, submap->points + submap->size(), merged->points + begin, [&](const Eigen::Vector4d& p) { return submap_poses[i] * p; });
-      if (submap->intensities) {
-        std::copy(submap->intensities, submap->intensities + submap->size(), merged->intensities + begin);
-      } else {
-        std::fill(merged->intensities + begin, merged->intensities + begin + submap->size(), 0.0);
+      std::vector<SubmapEntry> entries_snapshot;
+      {
+        std::lock_guard<std::mutex> lock(submap_mutex);
+        entries_snapshot = submap_entries;
       }
-      begin += submap->size();
-    }
 
-    auto points_msg = frame_to_pointcloud2(map_frame_id, now.seconds(), *merged);
-    map_pub->publish(*points_msg);
+      int total_num_points = 0;
+      for (const auto& entry : entries_snapshot) {
+        total_num_points += entry.frame->size();
+      }
+
+      gtsam_points::PointCloudCPU::Ptr merged(new gtsam_points::PointCloudCPU);
+      merged->num_points = total_num_points;
+      merged->points_storage.resize(total_num_points);
+      merged->points = merged->points_storage.data();
+      merged->intensities_storage.resize(total_num_points);
+      merged->intensities = merged->intensities_storage.data();
+
+      int begin = 0;
+      for (const auto& entry : entries_snapshot) {
+        const auto& submap = entry.frame;
+        std::transform(submap->points, submap->points + submap->size(), merged->points + begin, [&](const Eigen::Vector4d& p) { return entry.T_world_origin * p; });
+        if (submap->intensities) {
+          std::copy(submap->intensities, submap->intensities + submap->size(), merged->intensities + begin);
+        } else {
+          std::fill(merged->intensities + begin, merged->intensities + begin + submap->size(), 0.0);
+        }
+        begin += submap->size();
+      }
+
+      const rclcpp::Time now = rclcpp::Clock(rcl_clock_type_t::RCL_ROS_TIME).now();
+      auto points_msg = frame_to_pointcloud2(map_frame_id, now.seconds(), *merged);
+      map_pub->publish(*points_msg);
+
+      logger->info("Published global map (num_submaps={} num_points={})", entries_snapshot.size(), total_num_points);
+      globalmap_request.store(false);
+    });
   });
 }
 

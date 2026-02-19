@@ -41,6 +41,7 @@ private:
   void set_callbacks();
   void odometry_new_frame(const EstimationFrame::ConstPtr& new_frame, bool corrected);
   void globalmap_on_update_submaps(const std::vector<SubMap::Ptr>& submaps);
+  void publish_nearby_map();
   void invoke(const std::function<void()>& task);
 
   void spin_once();
@@ -67,6 +68,7 @@ private:
   std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> aligned_points_pub;
   std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> map_pub;
   std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> submap_pub;
+  std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>> nearby_map_pub;
 
   std::shared_ptr<rclcpp::Publisher<nav_msgs::msg::Odometry>> odom_pub;
   std::shared_ptr<rclcpp::Publisher<geometry_msgs::msg::PoseStamped>> pose_pub;
@@ -84,7 +86,24 @@ private:
   std::mutex trajectory_mutex;
   std::unique_ptr<TrajectoryManager> trajectory;
 
-  std::vector<gtsam_points::PointCloud::ConstPtr> submaps;
+  // Submap storage with poses
+  struct SubmapEntry {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    Eigen::Isometry3d T_world_origin;
+    gtsam_points::PointCloud::ConstPtr frame;
+  };
+  std::mutex submap_mutex;
+  std::vector<SubmapEntry> submap_entries;
+
+  // Current position for nearby map
+  std::mutex current_pose_mutex;
+  Eigen::Vector3d current_position = Eigen::Vector3d::Zero();
+  bool has_current_position = false;
+  double nearby_map_radius = 50.0;
+
+  // Global map thread
+  std::thread globalmap_thread;
+  std::atomic_bool globalmap_request{false};
 
   std::mutex invoke_queue_mutex;
   std::vector<std::function<void()>> invoke_queue;
